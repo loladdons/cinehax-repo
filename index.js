@@ -465,12 +465,33 @@ async function getMeta(id) {
 }
 
 function embedTag(html) {
-  var m = /data-embed="([^"]+)"/.exec(String(html || ''));
-  if (!m) return null;
-  var tag = decodeEntities(m[1]);
-  var src = (/\ssrc="([^"]+)"/.exec(tag) || [])[1];
-  var pass = (/\sdata-pass="([^"]+)"/.exec(tag) || [])[1];
-  return src && pass ? { src: siteUrl(src), pass: siteUrl(pass) } : null;
+  // Puede haber varios data-embed (LAT / ESP / SUB). Preferir LAT.
+  var src = String(html || '');
+  var re = /data-embed="([^"]+)"/g;
+  var m;
+  var tags = [];
+  while ((m = re.exec(src)) !== null) {
+    var tag = decodeEntities(m[1]);
+    var iframeSrc = (/\ssrc="([^"]+)"/.exec(tag) || [])[1];
+    var pass = (/\sdata-pass="([^"]+)"/.exec(tag) || [])[1];
+    if (iframeSrc && pass && iframeSrc.indexOf('youtube') < 0) {
+      tags.push({ src: siteUrl(iframeSrc), pass: siteUrl(pass), raw: tag });
+    }
+  }
+  if (!tags.length) return null;
+  for (var i = 0; i < tags.length; i++) {
+    if (/lang=LAT/i.test(tags[i].src) || /lang=LAT/i.test(tags[i].raw)) return tags[i];
+  }
+  return tags[0];
+}
+
+function apiBaseFromEmbed(src) {
+  // https://cinehaxplus.com/pv/embed/movie/123 → https://cinehaxplus.com/pv
+  var s = String(src || '');
+  var m = /^(https?:\/\/[^/]+)(\/pv)\//i.exec(s);
+  if (m) return m[1] + m[2];
+  var o = originOf(s);
+  return o ? o + '/pv' : null;
 }
 
 function originOf(url) {
@@ -503,13 +524,20 @@ function embFromSrc(src) {
 }
 
 function ordenaServidores(lista, lang) {
-  var pref = (lang || 'lat').toLowerCase();
+  var pref = String(lang || 'LAT').toLowerCase();
   return (lista || []).slice().sort(function (a, b) {
-    var an = String(a.name || a.lang || '').toLowerCase();
-    var bn = String(b.name || b.lang || '').toLowerCase();
-    var as = an.indexOf(pref) >= 0 || an.indexOf('lat') >= 0 ? 0 : 1;
-    var bs = bn.indexOf(pref) >= 0 || bn.indexOf('lat') >= 0 ? 0 : 1;
-    return as - bs;
+    function score(s) {
+      var L = String(s.lang || s.name || '').toLowerCase();
+      var sc = 10;
+      if (L === pref || L.indexOf(pref) >= 0) sc = 0;
+      else if (L.indexOf('lat') >= 0) sc = 1;
+      else if (L.indexOf('esp') >= 0 || L.indexOf('cast') >= 0) sc = 2;
+      else if (L.indexOf('sub') >= 0) sc = 3;
+      if ((s.mode || '') === 'directo') sc -= 0.5;
+      if ((s.type || '') === 'iframe') sc += 20;
+      return sc;
+    }
+    return score(a) - score(b);
   });
 }
 
@@ -517,115 +545,167 @@ async function flujoPlayer(watchUrl) {
   var page = await getText(watchUrl);
   if (!page) return [];
 
-  // 1) data-embed + pass (flujo principal del sitio)
   var embed = embedTag(page);
   var streams = [];
-  if (embed) {
-    try {
-      var pass = await getJson(embed.pass);
-      if (pass && pass.pass) {
-        var sep = embed.src.indexOf('?') >= 0 ? '&' : '?';
-        var embedHtml = await httpText(
-          embed.src + sep + 'pass=' + encodeURIComponent(pass.pass),
-          { headers: { 'User-Agent': UA, Referer: BASE() + '/' } }
-        );
-        if (embedHtml) {
-          var ui = (embedHtml.match(/PM_UI="([^"]+)"/) || [])[1];
-          var emb = null;
-          var embRaw = (embedHtml.match(/PM_EMBED=(\{[\s\S]*?\})\s*;/) ||
-            embedHtml.match(/PM_EMBED=(\{[^;]+)\}/) ||
-            [])[1];
-          if (embRaw) {
-            try {
-              emb = JSON.parse(embRaw);
-            } catch (e) {}
-          }
-          if (!emb) emb = embFromSrc(embed.src);
-          var origin = originOf(embed.src);
-          if (ui && emb && emb.tmdb && origin) {
-            var params = embParams(emb);
-            var pide = {
-              headers: {
-                'User-Agent': UA,
-                Referer: origin + '/',
-                Origin: origin,
-              },
-            };
-            var srv = await getJson(
-              origin +
-                '/servers?' +
-                params +
-                '&ui=' +
-                encodeURIComponent(ui),
-              pide
-            );
-            var lista =
-              srv && Array.isArray(srv.servers) ? srv.servers : [];
-            var orden = ordenaServidores(lista, emb.lang);
-            for (var i = 0; i < orden.length && i < 15; i++) {
-              var s = orden[i];
-              var v = await getJson(
-                origin +
-                  '/video?' +
-                  params +
-                  '&noiframe=1&embed=' +
-                  encodeURIComponent(s.id) +
-                  '&r=1&ui=' +
-                  encodeURIComponent(ui),
-                pide
-              );
-              if (!v || !v.url || v.type === 'iframe') continue;
-              var isHls =
-                v.type === 'hls' ||
-                String(v.url).indexOf('.m3u8') >= 0 ||
-                String(v.mime || '').indexOf('mpegurl') >= 0;
-              streams.push({
-                url: v.url,
-                name:
-                  (s.name || s.host || 'Servidor') +
-                  (s.lang ? ' · ' + s.lang : ''),
-                quality: v.quality || (isHls ? 'HLS' : 'Auto'),
-                language: s.lang || emb.lang || 'Latino',
-                provider: 'cinehax',
-                isHls: !!isHls,
-                headers: {
-                  'User-Agent': UA,
-                  Referer: origin + '/',
-                  Origin: origin,
-                },
-              });
-            }
-          }
-        }
-      }
-    } catch (e) {}
+  if (!embed) {
+    // sin data-embed: buscar m3u8 sueltos
+    return scrapeMediaUrls(page);
   }
 
-  // 2) Fallback: buscar m3u8/mp4 en el HTML de la página de watch
-  if (!streams.length) {
-    var found = {};
-    var reUrl =
-      /(https?:\/\/[^\s"'<>]+?\.(?:m3u8|mp4)[^\s"'<>]*)/gi;
-    var um;
-    while ((um = reUrl.exec(page)) !== null) {
-      var u = um[1].replace(/&amp;/g, '&');
-      if (found[u]) continue;
-      found[u] = 1;
-      var hls = u.indexOf('.m3u8') >= 0;
-      streams.push({
-        url: u,
-        name: hls ? 'HLS (página)' : 'MP4 (página)',
-        quality: hls ? 'HLS' : 'Auto',
-        language: 'Latino',
-        provider: 'cinehax',
-        isHls: hls,
+  try {
+    var pass = await getJson(embed.pass, {
+      headers: { 'User-Agent': UA, Referer: BASE() + '/', Accept: 'application/json' },
+    });
+    if (!pass || !pass.pass) return scrapeMediaUrls(page);
+
+    var sep = embed.src.indexOf('?') >= 0 ? '&' : '?';
+    var embedHtml = await httpText(
+      embed.src + sep + 'pass=' + encodeURIComponent(pass.pass),
+      {
         headers: {
           'User-Agent': UA,
-          Referer: BASE() + '/',
+          Referer: watchUrl,
+          Accept: 'text/html,*/*',
+        },
+      }
+    );
+    if (!embedHtml) return scrapeMediaUrls(page);
+
+    var ui = (embedHtml.match(/PM_UI="([^"]+)"/) || [])[1];
+    var emb = null;
+    var embM =
+      embedHtml.match(/PM_EMBED=(\{[\s\S]*?\})\s*;/) ||
+      embedHtml.match(/PM_EMBED=(\{[^;]+)/);
+    if (embM) {
+      try {
+        emb = JSON.parse(embM[1]);
+      } catch (e) {
+        try {
+          emb = JSON.parse(embM[1] + '}');
+        } catch (e2) {}
+      }
+    }
+    if (!emb) emb = embFromSrc(embed.src);
+
+    var api = apiBaseFromEmbed(embed.src);
+    if (!ui || !emb || !emb.tmdb || !api) {
+      return scrapeMediaUrls(page + '\n' + (embedHtml || ''));
+    }
+
+    // type movie|tv (no "pelicula")
+    var type = emb.type === 'tv' || emb.type === 'serie' ? 'tv' : 'movie';
+    var params = 'tmdb=' + emb.tmdb + '&type=' + type;
+    if (type === 'tv') {
+      params +=
+        '&season=' +
+        (emb.season || 1) +
+        '&episode=' +
+        (emb.episode || 1);
+    }
+
+    var pide = {
+      headers: {
+        'User-Agent': UA,
+        Referer: api + '/',
+        Origin: originOf(api) || BASE(),
+        Accept: 'application/json,*/*',
+      },
+    };
+
+    var srv = await getJson(
+      api + '/servers?' + params + '&ui=' + encodeURIComponent(ui),
+      pide
+    );
+    var lista = srv && Array.isArray(srv.servers) ? srv.servers : [];
+    if (!lista.length) {
+      return scrapeMediaUrls(page + '\n' + embedHtml);
+    }
+
+    var orden = ordenaServidores(lista, emb.lang || 'LAT');
+    for (var i = 0; i < orden.length && i < 15; i++) {
+      var s = orden[i];
+      var finalUrl = null;
+      var isHls = (s.type || '') === 'hls' || (s.mode || '') === 'directo';
+
+      // 1) endpoint /video (url firmada real)
+      try {
+        var v = await getJson(
+          api +
+            '/video?' +
+            params +
+            '&noiframe=1&embed=' +
+            encodeURIComponent(s.id) +
+            '&r=1&ui=' +
+            encodeURIComponent(ui),
+          pide
+        );
+        if (v && v.url && v.type !== 'iframe') {
+          finalUrl = v.url;
+          isHls =
+            v.type === 'hls' ||
+            String(v.url).indexOf('.m3u8') >= 0 ||
+            isHls;
+        }
+      } catch (e) {}
+
+      // 2) campo video del listado (también apunta a /pv/video?...)
+      if (!finalUrl && s.video) {
+        // si es endpoint, resolver JSON
+        if (String(s.video).indexOf('/pv/video') >= 0) {
+          try {
+            var v2 = await getJson(s.video + (s.video.indexOf('?') >= 0 ? '&' : '?') + 'ui=' + encodeURIComponent(ui) + '&r=1&noiframe=1', pide);
+            if (v2 && v2.url) finalUrl = v2.url;
+          } catch (e2) {}
+        }
+        if (!finalUrl) finalUrl = s.video;
+      }
+
+      if (!finalUrl) continue;
+
+      streams.push({
+        url: finalUrl,
+        name:
+          (s.name || 'Servidor ' + (i + 1)) +
+          (s.lang ? ' · ' + s.lang : ''),
+        quality: isHls ? 'HLS' : s.type || 'Auto',
+        language: s.lang || emb.lang || 'Latino',
+        provider: 'cinehax',
+        isHls: !!isHls || String(finalUrl).indexOf('.m3u8') >= 0,
+        headers: {
+          'User-Agent': UA,
+          Referer: api + '/',
+          Origin: originOf(api) || BASE(),
         },
       });
-      if (streams.length >= 5) break;
     }
+  } catch (e) {
+    // sigue a fallback
+  }
+
+  if (!streams.length) streams = scrapeMediaUrls(page);
+  return streams;
+}
+
+function scrapeMediaUrls(html) {
+  var streams = [];
+  var found = {};
+  var re = /(https?:\/\/[^\s"'<>]+?\.(?:m3u8|mp4)[^\s"'<>]*)/gi;
+  var um;
+  while ((um = re.exec(String(html || ''))) !== null) {
+    var u = um[1].replace(/&amp;/g, '&');
+    if (found[u]) continue;
+    found[u] = 1;
+    var hls = u.indexOf('.m3u8') >= 0;
+    streams.push({
+      url: u,
+      name: hls ? 'HLS' : 'MP4',
+      quality: hls ? 'HLS' : 'Auto',
+      language: 'Latino',
+      provider: 'cinehax',
+      isHls: hls,
+      headers: { 'User-Agent': UA, Referer: BASE() + '/' },
+    });
+    if (streams.length >= 6) break;
   }
   return streams;
 }
