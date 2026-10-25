@@ -24,6 +24,9 @@ function pestanas() {
   return String(cfg().pestanas || 'ambas').toLowerCase();
 }
 
+function absUrl(u) {
+  return siteUrl(u);
+}
 function siteUrl(href) {
   var s = String(href || '');
   if (/^https?:\/\//i.test(s)) return s;
@@ -323,52 +326,138 @@ function parseId(id) {
 function parseEpisodes(html, slug, forceSeason) {
   var out = [];
   var src = String(html || '');
-  var re =
-    /href="(\/serie\/[^"]+\/temporada\/(\d+)\/episodio\/(\d+)[^"]*)"/g;
-  var m;
   var seen = {};
-  while ((m = re.exec(src)) !== null) {
-    var season = forceSeason || parseInt(m[2], 10);
-    var episode = parseInt(m[3], 10);
-    var key = season + 'x' + episode;
-    if (seen[key]) continue;
-    seen[key] = 1;
-    var title = 'Episodio ' + episode;
-    var chunk = src.slice(Math.max(0, m.index - 120), m.index + 280);
-    // pc-t / títulos cerca del enlace
-    var tm =
-      /<(?:span|div|p|h[1-6])[^>]*class="[^"]*"[^>]*>([^<]{2,90})<\/(?:span|div|p|h[1-6])>/.exec(
-        chunk
-      ) || />([^<]{3,80})<\/a>/.exec(chunk);
-    if (tm) {
-      var tt = textOf(tm[1]);
-      if (tt && tt.length >= 2 && tt.length < 90 && !/temporada|episodio/i.test(tt)) {
-        title = tt;
+
+  // 1) JSON-LD TVEpisode (títulos reales)
+  try {
+    var ldRe = /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+    var lm;
+    while ((lm = ldRe.exec(src)) !== null) {
+      var raw = lm[1].trim();
+      if (!raw) continue;
+      var data;
+      try {
+        data = JSON.parse(raw);
+      } catch (e) {
+        continue;
+      }
+      var nodes = [];
+      function walk(n) {
+        if (!n) return;
+        if (Array.isArray(n)) {
+          for (var i = 0; i < n.length; i++) walk(n[i]);
+          return;
+        }
+        if (typeof n !== 'object') return;
+        var t = n['@type'];
+        if (t === 'TVEpisode' || (Array.isArray(t) && t.indexOf('TVEpisode') >= 0)) {
+          nodes.push(n);
+        }
+        if (n['@graph']) walk(n['@graph']);
+        if (n.episode) walk(n.episode);
+        if (n.episodes) walk(n.episodes);
+        if (n.containsSeason) walk(n.containsSeason);
+        if (n.partOfSeason) {
+          /* ignore */
+        }
+      }
+      walk(data);
+      for (var j = 0; j < nodes.length; j++) {
+        var ep = nodes[j];
+        var num =
+          parseInt(ep.episodeNumber || ep.episode || ep.number || 0, 10) || 0;
+        if (!num) continue;
+        var season =
+          forceSeason ||
+          parseInt(
+            (ep.partOfSeason &&
+              (ep.partOfSeason.seasonNumber || ep.partOfSeason.number)) ||
+              forceSeason ||
+              1,
+            10
+          ) ||
+          1;
+        var key = season + 'x' + num;
+        if (seen[key]) continue;
+        seen[key] = 1;
+        var img = null;
+        if (ep.image) {
+          if (typeof ep.image === 'string') img = ep.image;
+          else if (ep.image.url) img = ep.image.url;
+          else if (Array.isArray(ep.image) && ep.image[0]) {
+            img =
+              typeof ep.image[0] === 'string'
+                ? ep.image[0]
+                : ep.image[0].url || null;
+          }
+        }
+        out.push({
+          number: num,
+          id: 'serie.' + slug + '.s' + season + 'e' + num,
+          title: ep.name || ep.title || 'Episodio ' + num,
+          still: img ? absUrl(img) : null,
+          overview: ep.description || null,
+        });
       }
     }
-    out.push({
-      number: episode,
-      id: 'serie.' + slug + '.s' + season + 'e' + episode,
-      title: title,
-      still: null,
-    });
-  }
-  // formato alternativo data-episode / botones
-  if (!out.length) {
-    var re2 = /temporada[^\d]*(\d+)[^\d]+episodio[^\d]*(\d+)/gi;
-    while ((m = re2.exec(src)) !== null) {
-      var s2 = forceSeason || parseInt(m[1], 10);
-      var e2 = parseInt(m[2], 10);
-      var k2 = s2 + 'x' + e2;
-      if (seen[k2]) continue;
-      seen[k2] = 1;
+  } catch (e) {}
+
+  // 2) Tarjetas HTML por episodio (imagen + título)
+  if (out.length < 2) {
+    var cardRe =
+      /href="(\/serie\/[^"]+\/temporada\/(\d+)\/episodio\/(\d+)[^"]*)"[\s\S]{0,600}?/g;
+    // Mejor: bloques con img cercana
+    var blocks = src.split(/href="(\/serie\/[^"]+\/temporada\/\d+\/episodio\/\d+[^"]*)"/);
+    // split leaves: text, href, text, href...
+    for (var bi = 1; bi < blocks.length; bi += 2) {
+      var href = blocks[bi];
+      var after = blocks[bi + 1] || '';
+      var before = blocks[bi - 1] || '';
+      var hm = /\/temporada\/(\d+)\/episodio\/(\d+)/.exec(href);
+      if (!hm) continue;
+      var season = forceSeason || parseInt(hm[1], 10);
+      var episode = parseInt(hm[2], 10);
+      var key2 = season + 'x' + episode;
+      if (seen[key2]) {
+        // actualizar still/title si faltaba
+        continue;
+      }
+      seen[key2] = 1;
+      var chunk = (before.slice(-400) + after.slice(0, 500));
+      var title = 'Episodio ' + episode;
+      var tm =
+        /<(?:span|div|p|h[1-6]|small)[^>]*class="[^"]*(?:pc-t|cd-t|ep-t|title)[^"]*"[^>]*>([\s\S]*?)<\/(?:span|div|p|h[1-6]|small)>/i.exec(
+          chunk
+        ) ||
+        /alt="([^"]{2,120})"/.exec(chunk);
+      if (tm) {
+        var tt = textOf(tm[1]);
+        if (tt && tt.length >= 2 && tt.length < 120) title = tt;
+      }
+      var im = /src="((?:https?:)?\/\/[^"]+\/(?:t\/p\/|content\/uploads\/)[^"]+)"/i.exec(
+        chunk
+      ) || /src="((?:https?:)?\/\/image\.tmdb\.org[^"]+)"/i.exec(chunk);
+      var still = im ? absUrl(im[1]) : null;
       out.push({
-        number: e2,
-        id: 'serie.' + slug + '.s' + s2 + 'e' + e2,
-        title: 'Episodio ' + e2,
+        number: episode,
+        id: 'serie.' + slug + '.s' + season + 'e' + episode,
+        title: title,
+        still: still,
       });
     }
+  } else {
+    // Rellenar stills desde HTML si JSON-LD no trajo imagen
+    for (var k = 0; k < out.length; k++) {
+      if (out[k].still) continue;
+      var er =
+        'episodio/' +
+        out[k].number +
+        '[^"]*"[\\s\\S]{0,400}?src="((?:https?:)?\\/\\/[^"]+)"';
+      var em = new RegExp(er, 'i').exec(src);
+      if (em) out[k].still = absUrl(em[1]);
+    }
   }
+
   out.sort(function (a, b) {
     return a.number - b.number;
   });
@@ -843,49 +932,97 @@ async function getDiscover(opts) {
   opts = opts || {};
   if (typeof opts === 'string') opts = { filter: opts };
   var page = parseInt(opts.page || 1, 10) || 1;
-  var filter = String(
-    opts.filter || opts.genre || opts.catalog || opts.id || ''
-  ).toLowerCase();
-  var mode = pestanas();
 
+  // La app manda { tipo: 'peliculas'|'series', orden: 'trending'|... }
+  var tipo = String(
+    opts.tipo || opts.type || opts.kind || opts.filter || opts.genre || ''
+  ).toLowerCase();
+  var orden = String(
+    opts.orden || opts.sort || opts.order || opts.filter || ''
+  ).toLowerCase();
+  // Si solo viene un filter plano antiguo
+  if (!tipo && orden) {
+    if (orden.indexOf('serie') >= 0) {
+      tipo = 'series';
+      orden = '';
+    } else if (
+      orden === 'trending' ||
+      orden === 'popular' ||
+      orden === 'rating' ||
+      orden === 'release'
+    ) {
+      tipo = 'peliculas';
+    }
+  }
+
+  var mode = pestanas();
   var path = '/peliculas';
   if (
-    filter.indexOf('serie') >= 0 ||
-    filter === 'series' ||
+    tipo.indexOf('serie') >= 0 ||
+    tipo === 'series' ||
+    tipo === 'tv' ||
     mode === 'series'
   ) {
     path = '/series';
-  }
-  if (filter.indexOf('trend') >= 0 || filter === 'trending') {
-    path = path + (path.indexOf('?') >= 0 ? '&' : '?') + 'sort=trending';
-  } else if (filter.indexOf('popular') >= 0) {
-    path = path + (path.indexOf('?') >= 0 ? '&' : '?') + 'sort=popular';
-  } else if (filter.indexOf('rating') >= 0 || filter.indexOf('valor') >= 0) {
-    path = path + (path.indexOf('?') >= 0 ? '&' : '?') + 'sort=rating';
-  } else if (filter.indexOf('release') >= 0 || filter.indexOf('estreno') >= 0) {
-    path = path + (path.indexOf('?') >= 0 ? '&' : '?') + 'sort=release';
+  } else if (mode === 'peliculas') {
+    path = '/peliculas';
+  } else if (tipo.indexOf('peli') >= 0 || tipo === 'movies' || tipo === 'movie') {
+    path = '/peliculas';
   }
 
-  // paginación del sitio: /page/N o ?page=N
+  var sort = '';
+  if (orden.indexOf('trend') >= 0 || orden === 'trending') sort = 'trending';
+  else if (orden.indexOf('popular') >= 0) sort = 'popular';
+  else if (orden.indexOf('rating') >= 0 || orden.indexOf('valor') >= 0)
+    sort = 'rating';
+  else if (orden.indexOf('release') >= 0 || orden.indexOf('estreno') >= 0)
+    sort = 'release';
+
+  if (sort) path = path + '?sort=' + sort;
+
   var url = BASE() + path;
   if (page > 1) {
     if (path.indexOf('?') >= 0) {
       url = BASE() + path + '&page=' + page;
     } else {
-      // /peliculas/page/2
       url = BASE() + path + '/page/' + page;
     }
   }
 
   var html = await getText(url);
-  // si /page/ no funciona, probar ?page=
   if ((!html || html.length < 500) && page > 1) {
-    html = await getText(
-      BASE() + path + (path.indexOf('?') >= 0 ? '&' : '?') + 'page=' + page
-    );
+    var basePath = path.split('?')[0];
+    var qs = path.indexOf('?') >= 0 ? path.split('?')[1] : '';
+    url =
+      BASE() +
+      basePath +
+      '/page/' +
+      page +
+      (qs ? '?' + qs : '');
+    html = await getText(url);
   }
-  var cards = parseCards(html || '', 40);
-  var items = filterByPestanas(cards).map(toContentItem).filter(Boolean);
+
+  var cards = parseCards(html || '', 48);
+  // No aplicar filterByPestanas agresivo si el usuario ya eligió tipo
+  var items;
+  if (tipo.indexOf('serie') >= 0 || path.indexOf('/series') === 0) {
+    items = cards
+      .filter(function (x) {
+        return x.type === 'serie';
+      })
+      .map(toContentItem)
+      .filter(Boolean);
+  } else if (path.indexOf('/peliculas') === 0) {
+    items = cards
+      .filter(function (x) {
+        return x.type === 'pelicula';
+      })
+      .map(toContentItem)
+      .filter(Boolean);
+  } else {
+    items = filterByPestanas(cards).map(toContentItem).filter(Boolean);
+  }
+
   return {
     items: items,
     hasMore: items.length >= 20,
@@ -894,26 +1031,33 @@ async function getDiscover(opts) {
 }
 
 async function getDiscoverFilters() {
-  return [
-    {
-      id: 'tipo',
-      label: 'Tipo',
-      options: [
-        { id: 'peliculas', label: 'Películas' },
-        { id: 'series', label: 'Series' },
-      ],
-    },
-    {
-      id: 'orden',
-      label: 'Orden',
-      options: [
-        { id: 'trending', label: 'Tendencias' },
-        { id: 'popular', label: 'Popular' },
-        { id: 'rating', label: 'Mejor valoradas' },
-        { id: 'release', label: 'Estrenos' },
-      ],
-    },
-  ];
+  return {
+    filters: [
+      {
+        id: 'tipo',
+        label: 'Tipo',
+        options: [
+          { id: 'peliculas', label: 'Películas' },
+          { id: 'series', label: 'Series' },
+        ],
+      },
+      {
+        id: 'orden',
+        label: 'Orden',
+        options: [
+          { id: 'trending', label: 'Tendencias' },
+          { id: 'popular', label: 'Popular' },
+          { id: 'rating', label: 'Mejor valoradas' },
+          { id: 'release', label: 'Estrenos' },
+        ],
+      },
+    ],
+  };
+}
+
+/** Anuncios opcionales. Si no hay, la app no muestra modal. */
+async function getAds() {
+  return { enabled: false, items: [] };
 }
 
 async function getCatalogs() {
@@ -945,6 +1089,7 @@ if (typeof module !== 'undefined') {
     getNews: getNews,
     getDiscover: getDiscover,
     getDiscoverFilters: getDiscoverFilters,
+    getAds: getAds,
     getCatalogs: getCatalogs,
     getCatalog: getCatalog,
   };
