@@ -1,0 +1,25 @@
+{
+  "apiVersion": 6,
+  "maxApiVersion": 6,
+  "capabilities": {
+    "names": ["home", "search", "discover", "meta", "streams", "catalogs"],
+    "required": ["streams"],
+    "atLeastOneOf": ["search", "home"]
+  },
+  "manifest": {
+    "idPattern": "^[a-z0-9][a-z0-9-]{1,39}$",
+    "categories": { "values": ["movies", "series"] }
+  },
+  "timeoutsMs": {
+    "search": 15000,
+    "home": 20000,
+    "resolve": 30000
+  },
+  "fetch": {
+    "methods": ["GET", "POST", "HEAD"],
+    "defaultTimeoutMs": 15000
+  },
+  "errors": {
+    "codes": ["not_found", "unavailable", "auth_required"]
+  }
+}

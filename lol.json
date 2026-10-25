@@ -1,0 +1,41 @@
+{
+  "id": "cinehax-plus",
+  "name": "CineHax+",
+  "version": "0.3.3",
+  "apiVersion": 6,
+  "browser": false,
+  "entry": "index.js",
+  "section": { "label": "CineHax+" },
+  "icon": "icon.png",
+  "homepage": "https://cinehaxplus.com",
+  "author": "JuandreXter (port)",
+  "description": "Películas y series en español latino de CineHax+. Home, búsqueda, meta, episodios y streams.",
+  "color": "#2563EB",
+  "theme": {
+    "accent": "#2563EB",
+    "onAccent": "#FFFFFF",
+    "background": "#0B0C14",
+    "surface": "#1B1F2E",
+    "highlight": "#6EE7A8"
+  },
+  "capabilities": ["home", "search", "discover", "meta", "streams", "catalogs"],
+  "tabs": ["home", "discover", "search", "library", "settings"],
+  "newsImageStyle": "poster",
+  "config": [
+    {
+      "key": "pestanas",
+      "label": "Contenido",
+      "type": "select",
+      "default": "ambas",
+      "options": ["ambas", "peliculas", "series"],
+      "description": "Qué tipo de títulos mostrar en home/búsqueda"
+    },
+    {
+      "key": "base_url",
+      "label": "URL base (opcional)",
+      "type": "text",
+      "default": "https://cinehaxplus.com",
+      "placeholder": "https://cinehaxplus.com"
+    }
+  ]
+}
