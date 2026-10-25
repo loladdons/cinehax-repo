@@ -320,39 +320,57 @@ function parseId(id) {
   return null;
 }
 
-function parseEpisodes(html, slug) {
+function parseEpisodes(html, slug, forceSeason) {
   var out = [];
   var src = String(html || '');
-  // enlaces a episodios
   var re =
     /href="(\/serie\/[^"]+\/temporada\/(\d+)\/episodio\/(\d+)[^"]*)"/g;
   var m;
   var seen = {};
   while ((m = re.exec(src)) !== null) {
-    var season = parseInt(m[2], 10);
+    var season = forceSeason || parseInt(m[2], 10);
     var episode = parseInt(m[3], 10);
     var key = season + 'x' + episode;
     if (seen[key]) continue;
     seen[key] = 1;
-    var title = 'T' + season + ' E' + episode;
-    // intentar título cercano
-    var chunk = src.slice(Math.max(0, m.index - 80), m.index + 200);
-    var tm = /<(?:span|div|p)[^>]*>([^<]{3,80})<\/(?:span|div|p)>/.exec(chunk);
+    var title = 'Episodio ' + episode;
+    var chunk = src.slice(Math.max(0, m.index - 120), m.index + 280);
+    // pc-t / títulos cerca del enlace
+    var tm =
+      /<(?:span|div|p|h[1-6])[^>]*class="[^"]*"[^>]*>([^<]{2,90})<\/(?:span|div|p|h[1-6])>/.exec(
+        chunk
+      ) || />([^<]{3,80})<\/a>/.exec(chunk);
     if (tm) {
       var tt = textOf(tm[1]);
-      if (tt && tt.length < 80) title = tt;
+      if (tt && tt.length >= 2 && tt.length < 90 && !/temporada|episodio/i.test(tt)) {
+        title = tt;
+      }
     }
     out.push({
+      number: episode,
       id: 'serie.' + slug + '.s' + season + 'e' + episode,
-      season: season,
-      episode: episode,
       title: title,
       still: null,
     });
   }
+  // formato alternativo data-episode / botones
+  if (!out.length) {
+    var re2 = /temporada[^\d]*(\d+)[^\d]+episodio[^\d]*(\d+)/gi;
+    while ((m = re2.exec(src)) !== null) {
+      var s2 = forceSeason || parseInt(m[1], 10);
+      var e2 = parseInt(m[2], 10);
+      var k2 = s2 + 'x' + e2;
+      if (seen[k2]) continue;
+      seen[k2] = 1;
+      out.push({
+        number: e2,
+        id: 'serie.' + slug + '.s' + s2 + 'e' + e2,
+        title: 'Episodio ' + e2,
+      });
+    }
+  }
   out.sort(function (a, b) {
-    if (a.season !== b.season) return a.season - b.season;
-    return a.episode - b.episode;
+    return a.number - b.number;
   });
   return out;
 }
@@ -384,7 +402,7 @@ function parseDetail(html) {
 async function getMeta(id) {
   var p = parseId(id);
   if (!p) {
-    return { id: id, title: String(id), type: 'movie' };
+    return { id: id, title: String(id), type: 'movie', seasons: [] };
   }
   var isSerie = p.type === 'serie';
   var url = BASE() + (isSerie ? '/serie/' : '/pelicula/') + p.slug;
@@ -398,22 +416,22 @@ async function getMeta(id) {
     backdrop: detail.poster,
     overview: detail.overview || '',
     year: detail.year || yearFromSlug(p.slug),
+    seasons: [],
     extra: {
       source: 'cinehax',
       type: p.type,
       slug: p.slug,
     },
   };
+
   if (isSerie) {
-    var seasons = [];
-    // detectar números de temporada
     var seasonNums = [];
     var sre = /\/temporada\/(\d+)/g;
     var sm;
     var sseen = {};
     while ((sm = sre.exec(html || '')) !== null) {
       var n = parseInt(sm[1], 10);
-      if (!sseen[n]) {
+      if (!sseen[n] && n > 0) {
         sseen[n] = 1;
         seasonNums.push(n);
       }
@@ -422,16 +440,26 @@ async function getMeta(id) {
     seasonNums.sort(function (a, b) {
       return a - b;
     });
-    var allEps = [];
-    for (var i = 0; i < seasonNums.length && i < 20; i++) {
+
+    var seasons = [];
+    for (var i = 0; i < seasonNums.length && i < 25; i++) {
+      var sn = seasonNums[i];
       var sh = await getText(
-        BASE() + '/serie/' + p.slug + '/temporada/' + seasonNums[i]
+        BASE() + '/serie/' + p.slug + '/temporada/' + sn
       );
-      var eps = parseEpisodes(sh || '', p.slug);
-      allEps = allEps.concat(eps);
+      var eps = parseEpisodes(sh || '', p.slug, sn);
+      if (!eps.length && sn === 1) {
+        // reintento con HTML principal
+        eps = parseEpisodes(html || '', p.slug, sn);
+      }
+      seasons.push({
+        number: sn,
+        name: 'Temporada ' + sn,
+        episodes: eps,
+      });
     }
-    item.episodes = allEps;
-    item.extra.seasons = seasonNums;
+    item.seasons = seasons;
+    item.type = 'series';
   }
   return item;
 }
@@ -488,66 +516,116 @@ function ordenaServidores(lista, lang) {
 async function flujoPlayer(watchUrl) {
   var page = await getText(watchUrl);
   if (!page) return [];
+
+  // 1) data-embed + pass (flujo principal del sitio)
   var embed = embedTag(page);
-  if (!embed) return [];
-
-  var pass = await getJson(embed.pass);
-  if (!pass || !pass.pass) return [];
-
-  var sep = embed.src.indexOf('?') >= 0 ? '&' : '?';
-  var embedHtml = await httpText(
-    embed.src + sep + 'pass=' + encodeURIComponent(pass.pass),
-    { headers: { 'User-Agent': UA } }
-  );
-  if (!embedHtml) return [];
-
-  var ui = (embedHtml.match(/PM_UI="([^"]+)"/) || [])[1];
-  var emb = null;
-  try {
-    emb = JSON.parse((embedHtml.match(/PM_EMBED=(\{[^}]+\})/) || [])[1] || 'null');
-  } catch (e) {}
-  if (!emb) emb = embFromSrc(embed.src);
-  var origin = originOf(embed.src);
-  if (!ui || !emb || !emb.tmdb || !origin) return [];
-
-  var params = embParams(emb);
-  var pide = { headers: { 'User-Agent': UA } };
-  var srv = await getJson(
-    origin + '/servers?' + params + '&ui=' + encodeURIComponent(ui),
-    pide
-  );
-  var lista = srv && Array.isArray(srv.servers) ? srv.servers : [];
-  if (!lista.length) return [];
-
-  var orden = ordenaServidores(lista, emb.lang);
   var streams = [];
-  for (var i = 0; i < orden.length && i < 12; i++) {
-    var s = orden[i];
-    var v = await getJson(
-      origin +
-        '/video?' +
-        params +
-        '&noiframe=1&embed=' +
-        encodeURIComponent(s.id) +
-        '&r=1&ui=' +
-        encodeURIComponent(ui),
-      pide
-    );
-    if (!v || !v.url || v.type === 'iframe') continue;
-    var isHls = v.type === 'hls' || String(v.url).indexOf('.m3u8') >= 0;
-    streams.push({
-      url: v.url,
-      name: s.name || s.host || 'Servidor ' + (i + 1),
-      quality: v.quality || (isHls ? 'HLS' : 'Auto'),
-      language: s.lang || emb.lang || 'Latino',
-      provider: 'cinehax',
-      isHls: isHls,
-      headers: {
-        'User-Agent': UA,
-        Referer: origin + '/',
-        Origin: origin,
-      },
-    });
+  if (embed) {
+    try {
+      var pass = await getJson(embed.pass);
+      if (pass && pass.pass) {
+        var sep = embed.src.indexOf('?') >= 0 ? '&' : '?';
+        var embedHtml = await httpText(
+          embed.src + sep + 'pass=' + encodeURIComponent(pass.pass),
+          { headers: { 'User-Agent': UA, Referer: BASE() + '/' } }
+        );
+        if (embedHtml) {
+          var ui = (embedHtml.match(/PM_UI="([^"]+)"/) || [])[1];
+          var emb = null;
+          var embRaw = (embedHtml.match(/PM_EMBED=(\{[\s\S]*?\})\s*;/) ||
+            embedHtml.match(/PM_EMBED=(\{[^;]+)\}/) ||
+            [])[1];
+          if (embRaw) {
+            try {
+              emb = JSON.parse(embRaw);
+            } catch (e) {}
+          }
+          if (!emb) emb = embFromSrc(embed.src);
+          var origin = originOf(embed.src);
+          if (ui && emb && emb.tmdb && origin) {
+            var params = embParams(emb);
+            var pide = {
+              headers: {
+                'User-Agent': UA,
+                Referer: origin + '/',
+                Origin: origin,
+              },
+            };
+            var srv = await getJson(
+              origin +
+                '/servers?' +
+                params +
+                '&ui=' +
+                encodeURIComponent(ui),
+              pide
+            );
+            var lista =
+              srv && Array.isArray(srv.servers) ? srv.servers : [];
+            var orden = ordenaServidores(lista, emb.lang);
+            for (var i = 0; i < orden.length && i < 15; i++) {
+              var s = orden[i];
+              var v = await getJson(
+                origin +
+                  '/video?' +
+                  params +
+                  '&noiframe=1&embed=' +
+                  encodeURIComponent(s.id) +
+                  '&r=1&ui=' +
+                  encodeURIComponent(ui),
+                pide
+              );
+              if (!v || !v.url || v.type === 'iframe') continue;
+              var isHls =
+                v.type === 'hls' ||
+                String(v.url).indexOf('.m3u8') >= 0 ||
+                String(v.mime || '').indexOf('mpegurl') >= 0;
+              streams.push({
+                url: v.url,
+                name:
+                  (s.name || s.host || 'Servidor') +
+                  (s.lang ? ' · ' + s.lang : ''),
+                quality: v.quality || (isHls ? 'HLS' : 'Auto'),
+                language: s.lang || emb.lang || 'Latino',
+                provider: 'cinehax',
+                isHls: !!isHls,
+                headers: {
+                  'User-Agent': UA,
+                  Referer: origin + '/',
+                  Origin: origin,
+                },
+              });
+            }
+          }
+        }
+      }
+    } catch (e) {}
+  }
+
+  // 2) Fallback: buscar m3u8/mp4 en el HTML de la página de watch
+  if (!streams.length) {
+    var found = {};
+    var reUrl =
+      /(https?:\/\/[^\s"'<>]+?\.(?:m3u8|mp4)[^\s"'<>]*)/gi;
+    var um;
+    while ((um = reUrl.exec(page)) !== null) {
+      var u = um[1].replace(/&amp;/g, '&');
+      if (found[u]) continue;
+      found[u] = 1;
+      var hls = u.indexOf('.m3u8') >= 0;
+      streams.push({
+        url: u,
+        name: hls ? 'HLS (página)' : 'MP4 (página)',
+        quality: hls ? 'HLS' : 'Auto',
+        language: 'Latino',
+        provider: 'cinehax',
+        isHls: hls,
+        headers: {
+          'User-Agent': UA,
+          Referer: BASE() + '/',
+        },
+      });
+      if (streams.length >= 5) break;
+    }
   }
   return streams;
 }
@@ -576,58 +654,101 @@ function watchUrlFromId(id, season, episode) {
 
 async function getStreams(id, type, season, episode) {
   if (id && typeof id === 'object') {
-    season = season || id.season;
-    episode = episode || id.episode;
+    season = season != null ? season : id.season;
+    episode = episode != null ? episode : id.episode;
     type = type || id.type;
-    id = id.id || id.contentId || '';
+    id = id.id || id.contentId || id.ref || '';
   }
-  var url = watchUrlFromId(id, season, episode);
+  // args pueden venir string "null"
+  if (season === 'null' || season === '') season = null;
+  if (episode === 'null' || episode === '') episode = null;
+  if (season != null) season = parseInt(season, 10) || season;
+  if (episode != null) episode = parseInt(episode, 10) || episode;
+
+  var idStr = String(id || '').trim();
+  var em = /^(serie)\.([^.]+)\.s(\d+)e(\d+)$/i.exec(idStr);
+  if (em) {
+    season = season || parseInt(em[3], 10);
+    episode = episode || parseInt(em[4], 10);
+    idStr = 'serie.' + em[2];
+  }
+
+  var url = watchUrlFromId(idStr, season, episode);
   if (!url) {
-    // intentar parse episodio en id
-    var em = /^(serie)\.([^.]+)\.s(\d+)e(\d+)$/i.exec(String(id));
-    if (em) {
-      url =
-        BASE() +
-        '/serie/' +
-        em[2] +
-        '/temporada/' +
-        em[3] +
-        '/episodio/' +
-        em[4];
-    }
+    return { streams: [], error: 'id inválido: ' + idStr };
   }
-  if (!url) return { streams: [], error: 'id inválido' };
+
   try {
     var streams = await flujoPlayer(url);
+    // Serie sin episodio concreto: primer ep T1
     if (!streams.length) {
-      // serie sin episodio: abrir primero de T1
-      var p = parseId(id);
-      if (p && p.type === 'serie' && !season) {
-        var t1 = await getText(BASE() + '/serie/' + p.slug + '/temporada/1');
-        var m = t1 && /\/temporada\/1\/episodio\/(\d+)/.exec(t1);
-        var ep = m ? m[1] : '1';
+      var p = parseId(idStr);
+      if (p && p.type === 'serie') {
+        var se = season || 1;
+        var t1 = await getText(
+          BASE() + '/serie/' + p.slug + '/temporada/' + se
+        );
+        var m =
+          t1 &&
+          new RegExp(
+            '/temporada/' + se + '/episodio/(\\d+)'
+          ).exec(t1);
+        var ep = episode || (m ? m[1] : '1');
         streams = await flujoPlayer(
-          BASE() + '/serie/' + p.slug + '/temporada/1/episodio/' + ep
+          BASE() +
+            '/serie/' +
+            p.slug +
+            '/temporada/' +
+            se +
+            '/episodio/' +
+            ep
         );
       }
     }
+    if (!streams.length) {
+      return {
+        streams: [],
+        error: 'Sin fuentes de video para ' + url,
+      };
+    }
     return { streams: streams };
   } catch (e) {
-    return { streams: [], error: String(e && e.message ? e.message : e) };
+    return {
+      streams: [],
+      error: String(e && e.message ? e.message : e),
+    };
   }
 }
 
 async function getNews() {
   try {
     var html = await getText(BASE() + '/');
-    var cards = parseCards(html || '', 12);
+    if (!html) return { items: [] };
+    // Preferir la fila "Tendencias de la semana" (o similar)
+    var sections = String(html).split('<section class="row">').slice(1);
+    var chosen = null;
+    var fallback = [];
+    for (var i = 0; i < sections.length; i++) {
+      var section = sections[i].split('</section>')[0];
+      var titleM = /<h2 class="row-t">([\s\S]*?)<\/h2>/.exec(section);
+      var title = titleM ? textOf(titleM[1]) : '';
+      var cards = parseCards(section, 16);
+      if (!cards.length) continue;
+      fallback = fallback.concat(cards);
+      if (/tendenc|semana|top|ranking|popular/i.test(title)) {
+        chosen = cards;
+        break;
+      }
+    }
+    var cardsOut = chosen || fallback.slice(0, 12);
     return {
-      items: cards.map(function (x) {
+      items: cardsOut.slice(0, 14).map(function (x) {
         return {
           title: x.title,
-          message: x.year ? String(x.year) : 'CineHax+',
+          message: x.year ? String(x.year) : 'Tendencias',
           poster: x.poster,
           banner: x.poster,
+          image: x.poster,
           id: x.id,
           imageStyle: 'poster',
         };
@@ -638,8 +759,81 @@ async function getNews() {
   }
 }
 
-async function getDiscover() {
-  return getHome();
+async function getDiscover(opts) {
+  opts = opts || {};
+  if (typeof opts === 'string') opts = { filter: opts };
+  var page = parseInt(opts.page || 1, 10) || 1;
+  var filter = String(
+    opts.filter || opts.genre || opts.catalog || opts.id || ''
+  ).toLowerCase();
+  var mode = pestanas();
+
+  var path = '/peliculas';
+  if (
+    filter.indexOf('serie') >= 0 ||
+    filter === 'series' ||
+    mode === 'series'
+  ) {
+    path = '/series';
+  }
+  if (filter.indexOf('trend') >= 0 || filter === 'trending') {
+    path = path + (path.indexOf('?') >= 0 ? '&' : '?') + 'sort=trending';
+  } else if (filter.indexOf('popular') >= 0) {
+    path = path + (path.indexOf('?') >= 0 ? '&' : '?') + 'sort=popular';
+  } else if (filter.indexOf('rating') >= 0 || filter.indexOf('valor') >= 0) {
+    path = path + (path.indexOf('?') >= 0 ? '&' : '?') + 'sort=rating';
+  } else if (filter.indexOf('release') >= 0 || filter.indexOf('estreno') >= 0) {
+    path = path + (path.indexOf('?') >= 0 ? '&' : '?') + 'sort=release';
+  }
+
+  // paginación del sitio: /page/N o ?page=N
+  var url = BASE() + path;
+  if (page > 1) {
+    if (path.indexOf('?') >= 0) {
+      url = BASE() + path + '&page=' + page;
+    } else {
+      // /peliculas/page/2
+      url = BASE() + path + '/page/' + page;
+    }
+  }
+
+  var html = await getText(url);
+  // si /page/ no funciona, probar ?page=
+  if ((!html || html.length < 500) && page > 1) {
+    html = await getText(
+      BASE() + path + (path.indexOf('?') >= 0 ? '&' : '?') + 'page=' + page
+    );
+  }
+  var cards = parseCards(html || '', 40);
+  var items = filterByPestanas(cards).map(toContentItem).filter(Boolean);
+  return {
+    items: items,
+    hasMore: items.length >= 20,
+    page: page,
+  };
+}
+
+async function getDiscoverFilters() {
+  return [
+    {
+      id: 'tipo',
+      label: 'Tipo',
+      options: [
+        { id: 'peliculas', label: 'Películas' },
+        { id: 'series', label: 'Series' },
+      ],
+    },
+    {
+      id: 'orden',
+      label: 'Orden',
+      options: [
+        { id: 'trending', label: 'Tendencias' },
+        { id: 'popular', label: 'Popular' },
+        { id: 'rating', label: 'Mejor valoradas' },
+        { id: 'release', label: 'Estrenos' },
+      ],
+    },
+  ];
 }
 
 async function getCatalogs() {
@@ -670,6 +864,7 @@ if (typeof module !== 'undefined') {
     getStreams: getStreams,
     getNews: getNews,
     getDiscover: getDiscover,
+    getDiscoverFilters: getDiscoverFilters,
     getCatalogs: getCatalogs,
     getCatalog: getCatalog,
   };
